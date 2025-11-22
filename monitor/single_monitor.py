@@ -18,6 +18,7 @@ class SingleMonitor:
     - maintain full history in self.data (unchanged)
     - provide sliding-window data to ChartWidget instances
     - minimize redraws (only if tab visible)
+    - supports per-monitor interval override and button interlock
     """
     def __init__(self, parent_frame, bv, get_global_interval, on_log, obot_client=None):
         self.parent_frame = parent_frame
@@ -37,6 +38,14 @@ class SingleMonitor:
 
         # sliding window size var (shared by charts)
         self.max_points = tk.IntVar(value=20)
+
+        # per-monitor interval (None => use global)
+        self.interval_var = tk.StringVar(value="")  # blank means use global
+        self.effective_interval_var = tk.IntVar(value=self.get_global_interval())
+
+        # button interlock guard
+        self._btn_busy = False
+        self._btn_lock = threading.Lock()
 
         # build UI & charts
         self._build_ui(parent_frame)
@@ -65,6 +74,17 @@ class SingleMonitor:
         ttk.Label(info, text="预计:").grid(row=0, column=3, sticky=tk.W)
         self.est_lbl = ttk.Label(info, text="未计算")
         self.est_lbl.grid(row=0, column=4, sticky=tk.W, padx=(4, 12))
+
+        # per-monitor interval controls (show & set)
+        interval_row = ttk.Frame(right_col)
+        interval_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(interval_row, text="本监控间隔(秒，留空使用全局):").pack(side=tk.LEFT)
+        self.interval_entry = ttk.Entry(interval_row, width=8, textvariable=self.interval_var)
+        self.interval_entry.pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(interval_row, text="应用本地间隔", command=self.apply_local_interval).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(interval_row, text="当前生效间隔:").pack(side=tk.LEFT, padx=(12, 0))
+        self.eff_lbl = ttk.Label(interval_row, textvariable=self.effective_interval_var)
+        self.eff_lbl.pack(side=tk.LEFT, padx=(6, 0))
 
         # sliding window control
         sw_ctrl = ttk.Frame(right_col)
@@ -102,27 +122,78 @@ class SingleMonitor:
         self.chart_coin = ChartWidget(self.tab_coin, f"{self.bv} - 投币", "投币", self.max_points)
         self.chart_danmaku = ChartWidget(self.tab_danmaku, f"{self.bv} - 弹幕", "弹幕", self.max_points)
 
-        # add small control buttons (open big / save / export) - simplified here
-        # you can expand these to re-use functions from original
+    # ---- per-monitor interval helpers ----
+    def apply_local_interval(self):
+        with self._btn_lock:
+            if self._btn_busy:
+                return
+            self._btn_busy = True
+        try:
+            s = self.interval_var.get().strip()
+            if not s:
+                # clear to use global
+                self.effective_interval_var.set(self.get_global_interval())
+                self._log_local("已清空本地间隔，使用全局间隔")
+                return
+            try:
+                v = int(s)
+                if v <= 0:
+                    raise ValueError
+                self.effective_interval_var.set(v)
+                self._log_local(f"已设置本地间隔 {v} 秒")
+            except Exception:
+                messagebox.showerror("错误", "请输入有效正整数或留空以使用全局")
+        finally:
+            with self._btn_lock:
+                self._btn_busy = False
 
+    def get_interval(self):
+        """Return effective interval in seconds for this monitor."""
+        try:
+            v = int(self.effective_interval_var.get())
+            if v > 0:
+                return v
+        except Exception:
+            pass
+        # fallback to global
+        return self.get_global_interval()
+
+    # ---- start / stop with button interlock ----
     def start(self):
-        if self.is_monitoring:
-            messagebox.showwarning("提示", f"{self.bv} 已在运行")
-            return
-        self.is_monitoring = True
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
-        self.log("开始监控")
+        with self._btn_lock:
+            if self._btn_busy:
+                return
+            self._btn_busy = True
+        try:
+            if self.is_monitoring:
+                messagebox.showwarning("提示", f"{self.bv} 已在运行")
+                return
+            self.is_monitoring = True
+            self.start_btn.config(state=tk.DISABLED)
+            self.stop_btn.config(state=tk.NORMAL)
+            self.thread = threading.Thread(target=self._run_loop, daemon=True)
+            self.thread.start()
+            self.log("开始监控")
+        finally:
+            with self._btn_lock:
+                self._btn_busy = False
 
     def stop(self):
-        if not self.is_monitoring:
-            return
-        self.is_monitoring = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.log("已请求停止")
+        with self._btn_lock:
+            if self._btn_busy:
+                return
+            self._btn_busy = True
+        try:
+            if not self.is_monitoring:
+                return
+            self.is_monitoring = False
+            # adjust buttons - actual re-enable will be cleaned up in _run_loop finally
+            self.start_btn.config(state=tk.NORMAL)
+            self.stop_btn.config(state=tk.DISABLED)
+            self.log("已请求停止")
+        finally:
+            with self._btn_lock:
+                self._btn_busy = False
 
     def _run_loop(self):
         loop = None
@@ -181,7 +252,7 @@ class SingleMonitor:
                     self.latest_info = {}
 
             except Exception as e:
-                interval = self.get_global_interval()
+                interval = self.get_interval()
                 self.log(f"获取失败: {e}，{interval}s 后重试")
                 await asyncio.sleep(interval)
                 continue
@@ -259,7 +330,7 @@ class SingleMonitor:
             self.frame.after(0, self._update_all_charts)
 
             # sleep current interval
-            await asyncio.sleep(self.get_global_interval())
+            await asyncio.sleep(self.get_interval())
 
         self.log("监控结束")
 
@@ -273,7 +344,6 @@ class SingleMonitor:
     def _is_visible(self):
         # attempt to detect whether the large parent tab is currently selected
         try:
-            # parent of self.frame is the BV tab; get its notebook
             parent = self.frame.nametowidget(self.frame.winfo_parent())
             parent_notebook = parent.nametowidget(parent.winfo_parent())
             return parent_notebook.select() == str(parent)
@@ -401,6 +471,12 @@ class SingleMonitor:
         except Exception:
             print(f"[{self.bv}] {msg}")
 
+    def _log_local(self, msg):
+        try:
+            self.on_log(f"[{self.bv}][local] {msg}")
+        except Exception:
+            print(f"[{self.bv}][local] {msg}")
+
     def parse_time(self, tstr):
         return datetime.datetime.strptime(tstr, "%Y-%m-%d %H:%M:%S")
 
@@ -410,8 +486,8 @@ class SingleMonitor:
         valid = []
         total_time = 0
         total_inc = 0
-        min_int = max(1, self.get_global_interval() * 0.5)
-        max_int = max(1, self.get_global_interval() * 2)
+        min_int = max(1, self.get_interval() * 0.5)
+        max_int = max(1, self.get_interval() * 2)
         for i in range(1, len(data)):
             try:
                 td = (self.parse_time(data[i]["time"]) - self.parse_time(data[i - 1]["time"])) .total_seconds()
@@ -441,11 +517,17 @@ class SingleMonitor:
             return f"约{est_seconds/3600:.1f}小时", est_date_str, len(valid), avg_interval
         else:
             return f"约{est_seconds/86400:.1f}天", est_date_str, len(valid), avg_interval
-    
+
     def manual_push(self):
         """
         按钮回调：格式化模版并通过 OneBot 推送当前最新样本数据。
+        支持将消息发送到多个群/用户（配置中支持逗号分隔或数组）
         """
+        # simple interlock to avoid double-click spam
+        with self._btn_lock:
+            if self._btn_busy:
+                return
+            self._btn_busy = True
         try:
             # 检查数据
             with self._lock:
@@ -516,27 +598,111 @@ class SingleMonitor:
                 messagebox.showwarning("OneBot 未启用", "请在设置中启用 OneBot 后再推送")
                 return
 
-            gid = cfg.get("onebot_group_id")
-            uid = cfg.get("onebot_user_id")
+            # gather targets: support legacy single value or new list / comma-separated string
+            group_ids = cfg.get("onebot_group_ids") or []
+            user_ids = cfg.get("onebot_user_ids") or []
 
-            sent = False
-            if gid:
+            # back-compat: older config keys
+            if not group_ids and cfg.get("onebot_group_id"):
+                group_ids = [cfg.get("onebot_group_id")]
+            if not user_ids and cfg.get("onebot_user_id"):
+                user_ids = [cfg.get("onebot_user_id")]
+
+            # normalize if comma-separated strings are present
+            def normalize_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, (list, tuple)):
+                    return [int(i) for i in x if str(i).strip()]
+                s = str(x).strip()
+                if not s:
+                    return []
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+                out = []
+                for p in parts:
+                    try:
+                        out.append(int(p))
+                    except Exception:
+                        continue
+                return out
+
+            group_ids = normalize_list(group_ids)
+            user_ids = normalize_list(user_ids)
+
+            sent_any = False
+            # send to groups first
+            for gid in group_ids:
                 params = {"group_id": int(gid), "message": msg}
-                sent = self.obot_client.send_msg("send_group_msg", params)
-            elif uid:
-                params = {"user_id": int(uid), "message": msg}
-                sent = self.obot_client.send_msg("send_private_msg", params)
-            else:
-                messagebox.showwarning("未配置接收目标", "未配置 group_id 或 user_id，无法推送")
-                return
+                ok = self.obot_client.send_msg("send_group_msg", params)
+                sent_any = sent_any or bool(ok)
 
-            if sent:
+            # then send to users if no groups or also as additional recipients
+            for uid in user_ids:
+                params = {"user_id": int(uid), "message": msg}
+                ok = self.obot_client.send_msg("send_private_msg", params)
+                sent_any = sent_any or bool(ok)
+
+            if sent_any:
                 self.log("手动推送已发送")
                 messagebox.showinfo("推送成功", "手动推送已发送（请查看 OneBot 日志）")
             else:
                 self.log("手动推送失败（发送接口返回 False 或未就绪）")
                 messagebox.showerror("推送失败", "发送失败，请查看日志或检查 OneBot 连接")
-
         except Exception as e:
             self.log(f"手动推送异常: {e}")
             messagebox.showerror("错误", f"手动推送失败: {e}")
+        finally:
+            with self._btn_lock:
+                self._btn_busy = False
+
+    # milestone notification (kept very simple)
+    def _notify_milestone(self, target, view):
+        # basic notification via OneBot (reuse manual_push text but short)
+        try:
+            if not self.obot_client:
+                return
+            cfg = self.obot_client.get_config() or {}
+            enabled = cfg.get("onebot_enabled", False)
+            if not enabled:
+                return
+            group_ids = cfg.get("onebot_group_ids") or []
+            user_ids = cfg.get("onebot_user_ids") or []
+            if not group_ids and cfg.get("onebot_group_id"):
+                group_ids = [cfg.get("onebot_group_id")]
+            if not user_ids and cfg.get("onebot_user_id"):
+                user_ids = [cfg.get("onebot_user_id")]
+
+            def normalize_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, (list, tuple)):
+                    return [int(i) for i in x if str(i).strip()]
+                s = str(x).strip()
+                if not s:
+                    return []
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+                out = []
+                for p in parts:
+                    try:
+                        out.append(int(p))
+                    except Exception:
+                        continue
+                return out
+
+            group_ids = normalize_list(group_ids)
+            user_ids = normalize_list(user_ids)
+
+            text = f"视频 {self.bv} 已达到里程碑: {view} / {target}"
+            sent_any = False
+            for gid in group_ids:
+                params = {"group_id": int(gid), "message": text}
+                ok = self.obot_client.send_msg("send_group_msg", params)
+                sent_any = sent_any or bool(ok)
+            for uid in user_ids:
+                params = {"user_id": int(uid), "message": text}
+                ok = self.obot_client.send_msg("send_private_msg", params)
+                sent_any = sent_any or bool(ok)
+            if sent_any:
+                self.log(f"里程碑通知已发送: {target}")
+        except Exception as e:
+            self.log(f"里程碑通知失败: {e}")

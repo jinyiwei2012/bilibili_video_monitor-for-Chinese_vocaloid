@@ -5,10 +5,6 @@ import json
 import websockets
 
 class OneBotWSClient:
-    """
-    Lightweight OneBot WebSocket client used by monitors.
-    Mirrors the behaviour in your original gui1.py but isolated here.
-    """
     def __init__(self, get_config_callable, on_log=None):
         self.get_config = get_config_callable
         self.on_log = on_log or (lambda m: print("[OneBotWS]", m))
@@ -42,6 +38,7 @@ class OneBotWSClient:
         self.log("OneBot WS client stopping")
 
     def send_msg(self, action, params):
+
         if not self._loop or not self._thread or not self._thread.is_alive():
             self.log("WS client not running, starting")
             self.start()
@@ -67,10 +64,15 @@ class OneBotWSClient:
             self.log(f"WS loop error: {e}\n{traceback.format_exc()}")
         finally:
             try:
-                self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+                if self._loop and not self._loop.is_closed():
+                    self._loop.run_until_complete(self._loop.shutdown_asyncgens())
             except Exception:
                 pass
-            self._loop.close()
+            if self._loop and not self._loop.is_closed():
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
             self._loop = None
             self.log("WS loop exited")
 
@@ -85,7 +87,7 @@ class OneBotWSClient:
     async def _main(self):
         reconnect_delay = 1
         while not self._stop_event.is_set():
-            cfg = self.get_config()
+            cfg = self.get_config() or {}
             ws_url = cfg.get("onebot_ws_url")
             enabled = cfg.get("onebot_enabled", False)
             if not enabled or not ws_url:
@@ -116,6 +118,7 @@ class OneBotWSClient:
             try:
                 action, params = await self._send_queue.get()
                 payload = {"action": action, "params": params}
+                # ensure JSON is serializable and maintain unicode
                 await ws.send(json.dumps(payload, ensure_ascii=False))
                 self.log(f"sent {payload}")
             except Exception as e:

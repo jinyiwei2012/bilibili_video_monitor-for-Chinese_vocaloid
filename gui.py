@@ -26,6 +26,7 @@ def save_config(cfg):
     except Exception as e:
         print("保存配置失败:", e)
 
+
 class BiliVideoMonitorGUI:
     def __init__(self, root):
         self.root = root
@@ -62,7 +63,7 @@ class BiliVideoMonitorGUI:
         ttk.Button(top, text="应用间隔（立即生效）", command=self.apply_interval).grid(row=0, column=5, padx=(8, 4))
         ttk.Button(top, text="保存默认间隔", command=self.save_default_interval).grid(row=0, column=6, padx=(8, 4))
 
-        # OneBot settings (simplified UI)
+        # OneBot settings (supports multiple group/user IDs comma-separated)
         onebot_frame = ttk.LabelFrame(main, text="OneBot (WebSocket) 设置", padding=8)
         onebot_frame.pack(fill=tk.X, pady=(0, 6))
 
@@ -74,15 +75,22 @@ class BiliVideoMonitorGUI:
         self.onebot_enabled_var = tk.BooleanVar(value=self.config.get("onebot_enabled", False))
         ttk.Checkbutton(onebot_frame, text="启用 OneBot 通知", variable=self.onebot_enabled_var).grid(row=0, column=2, padx=(8, 4))
 
-        ttk.Label(onebot_frame, text="群 ID (可选):").grid(row=1, column=0, sticky=tk.W)
-        self.onebot_group_entry = ttk.Entry(onebot_frame, width=20)
+        ttk.Label(onebot_frame, text="群 ID (可逗号分隔、多群):").grid(row=1, column=0, sticky=tk.W)
+        self.onebot_group_entry = ttk.Entry(onebot_frame, width=30)
         self.onebot_group_entry.grid(row=1, column=1, sticky=tk.W, padx=(4, 8))
-        self.onebot_group_entry.insert(0, str(self.config.get("onebot_group_id", "")))
+        # read both legacy and new keys
+        groups_val = self.config.get("onebot_group_ids") or self.config.get("onebot_group_id", "")
+        if isinstance(groups_val, (list, tuple)):
+            groups_val = ",".join(str(x) for x in groups_val)
+        self.onebot_group_entry.insert(0, str(groups_val))
 
-        ttk.Label(onebot_frame, text="私聊用户 ID (可选):").grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(onebot_frame, text="私聊用户 ID (可逗号分隔):").grid(row=1, column=2, sticky=tk.W)
         self.onebot_user_entry = ttk.Entry(onebot_frame, width=20)
         self.onebot_user_entry.grid(row=1, column=3, sticky=tk.W)
-        self.onebot_user_entry.insert(0, str(self.config.get("onebot_user_id", "")))
+        users_val = self.config.get("onebot_user_ids") or self.config.get("onebot_user_id", "")
+        if isinstance(users_val, (list, tuple)):
+            users_val = ",".join(str(x) for x in users_val)
+        self.onebot_user_entry.insert(0, str(users_val))
 
         ttk.Button(onebot_frame, text="保存 OneBot 配置并(重)连", command=self.save_onebot_config).grid(row=0, column=3, padx=(8, 4))
 
@@ -190,6 +198,14 @@ class BiliVideoMonitorGUI:
         self.config["default_interval"] = v
         save_config(self.config)
         self._log(f"已将间隔设置为 {v} 秒（实时生效）")
+        # update effective interval for monitors that don't have local overrides
+        for m in self.monitors.values():
+            try:
+                # only update those with empty local setting
+                if not m.interval_var.get().strip():
+                    m.effective_interval_var.set(v)
+            except Exception:
+                pass
 
     def save_default_interval(self):
         try:
@@ -206,12 +222,52 @@ class BiliVideoMonitorGUI:
     def save_onebot_config(self):
         url = self.onebot_url_entry.get().strip()
         enabled = bool(self.onebot_enabled_var.get())
-        gid = self.onebot_group_entry.get().strip()
-        uid = self.onebot_user_entry.get().strip()
+        gid_raw = self.onebot_group_entry.get().strip()
+        uid_raw = self.onebot_user_entry.get().strip()
+
+        # normalize to list or None
+        def parse_ids(s):
+            if s is None:
+                return None
+            s = str(s).strip()
+            if not s:
+                return None
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            out = []
+            for p in parts:
+                try:
+                    out.append(int(p))
+                except Exception:
+                    pass
+            return out if out else None
+
+        group_ids = parse_ids(gid_raw)
+        user_ids = parse_ids(uid_raw)
+
         self.config["onebot_ws_url"] = url
         self.config["onebot_enabled"] = enabled
-        self.config["onebot_group_id"] = int(gid) if gid else None
-        self.config["onebot_user_id"] = int(uid) if uid else None
+        # store lists (backwards-compatible logic kept)
+        if group_ids is not None:
+            self.config["onebot_group_ids"] = group_ids
+        else:
+            self.config.pop("onebot_group_ids", None)
+
+        if user_ids is not None:
+            self.config["onebot_user_ids"] = user_ids
+        else:
+            self.config.pop("onebot_user_ids", None)
+
+        # also keep single legacy keys for backward compatibility (first element)
+        if group_ids:
+            self.config["onebot_group_id"] = group_ids[0]
+        else:
+            self.config.pop("onebot_group_id", None)
+
+        if user_ids:
+            self.config["onebot_user_id"] = user_ids[0]
+        else:
+            self.config.pop("onebot_user_id", None)
+
         save_config(self.config)
         try:
             self.obot_client.stop()
@@ -262,6 +318,7 @@ def main():
 
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()
