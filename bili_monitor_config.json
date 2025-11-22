@@ -1,7 +1,7 @@
 {
     "onebot_ws_url": "ws://localhost:4120",
     "onebot_enabled": true,
-    "onebot_group_id": 156024418,
-    "onebot_user_id": 3606346312,
+    "onebot_group_id": ,
+    "onebot_user_id": ,
     "default_interval": 15
 }
