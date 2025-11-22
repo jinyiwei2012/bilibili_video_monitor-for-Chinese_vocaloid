@@ -657,3 +657,25 @@ class SingleMonitor:
             self.log("里程碑通知已发")
         except Exception as e:
             self.log("里程碑通知失败: %s" % e)
+
+    def _is_visible(self):
+        """
+        检查当前监控器界面是否可见（所在的 tab 是否是当前选中的）
+        """
+        try:
+            # 如果 frame 被销毁，不可见
+            if not self.frame.winfo_exists():
+                return False
+
+            # 找到该 frame 的 root notebook
+            parent = self.frame.nametowidget(self.frame.winfo_parent())
+            # 往上找 notebook
+            while parent is not None:
+                if isinstance(parent, ttk.Notebook):
+                    # 当前选中的 tab
+                    current = parent.select()
+                    return str(self.frame) == str(current)
+                parent = parent.nametowidget(parent.winfo_parent())
+        except Exception:
+            pass
+        return True

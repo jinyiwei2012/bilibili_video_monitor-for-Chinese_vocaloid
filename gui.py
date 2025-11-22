@@ -3,7 +3,12 @@ import os
 import json
 import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext,font
+import matplotlib
+matplotlib.rcParams['font.family'] = 'sans-serif'
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
 
 from monitor import SingleMonitor, OneBotWSClient
 
@@ -423,6 +428,7 @@ class BiliVideoMonitorGUI:
 
 def main():
     root = tk.Tk()
+    font.nametofont("TkDefaultFont").configure(family="Microsoft YaHei")
     app = BiliVideoMonitorGUI(root)
 
     def on_close():
