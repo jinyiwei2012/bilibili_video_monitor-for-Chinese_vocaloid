@@ -37,6 +37,7 @@ class SingleMonitor:
         self.last_view = None
         self.first_fetch = True
         self.check_10m_mode = False
+        self.special_push_done = False  # 距目标≤500播放特殊推送
 
         self.max_points = tk.IntVar(value=20)
         self.interval_var = tk.StringVar(value="")
@@ -258,6 +259,20 @@ class SingleMonitor:
             share = stat.get("share", 0)
             danmaku = stat.get("danmaku", 0)
             tms = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ===== 新增：距离目标 ≤ 500 播放触发特殊逻辑 =====
+            target_view = 10_000_000 if self.check_10m_mode else 1_000_000
+            remaining = target_view - view
+
+            if remaining <= 500 and remaining > 0:
+                # 1) 自动把间隔降到 10s
+                if self.get_interval() != 10:
+                    self.effective_interval_var.set(10)
+                    self.log("进入冲刺模式：距离目标 <=500 播放，间隔已临时降至 10 秒")
+
+                # 2) 特殊推送，只触发一次
+                if not self.special_push_done:
+                    self.special_push_done = True
+                    self._notify_special_remaining(remaining, view, target_view)
 
             with self._lock:
                 if self.last_view is None:
@@ -658,24 +673,97 @@ class SingleMonitor:
         except Exception as e:
             self.log("里程碑通知失败: %s" % e)
 
-    def _is_visible(self):
+    def _notify_special_remaining(self, remaining, view, target):
         """
-        检查当前监控器界面是否可见（所在的 tab 是否是当前选中的）
+        特殊推送：距离目标 <= 500 播放时触发一次
         """
         try:
-            # 如果 frame 被销毁，不可见
+            if not self.obot_client:
+                return
+            cfg = self.obot_client.get_config() or {}
+            if not cfg.get("onebot_enabled", False):
+                return
+
+            # 解析推送目标
+            group_ids = cfg.get("onebot_group_ids") or cfg.get("onebot_group_id") or []
+            user_ids = cfg.get("onebot_user_ids") or cfg.get("onebot_user_id") or []
+
+            def normalize_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, (list, tuple)):
+                    return [int(i) for i in x if str(i).strip()]
+                s = str(x).strip()
+                if not s:
+                    return []
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+                out = []
+                for p in parts:
+                    try:
+                        out.append(int(p))
+                    except Exception:
+                        continue
+                return out
+
+            group_ids = normalize_list(group_ids)
+            user_ids = normalize_list(user_ids)
+
+            bot_qq = str(cfg.get("onebot_bot_qq") or 0)
+
+            text = (
+                f"[冲刺提醒]\n"
+                f"BV {self.bv}\n"
+                f"当前播放: {view}\n"
+                f"目标: {target}\n"
+                f"距离目标还有 {remaining} 播放！\n"
+                f"已自动切换到 10 秒采样间隔。"
+            )
+
+            node_content = [{"type": "text", "data": {"text": text}}]
+            node = {"type": "node", "data": {"name": "监控器", "uin": bot_qq, "content": node_content}}
+
+            for gid in group_ids:
+                try:
+                    self.obot_client.send_group_forward(int(gid), [node])
+                except Exception:
+                    pass
+
+            for uid in user_ids:
+                try:
+                    self.obot_client.send_private_forward(int(uid), [node])
+                except Exception:
+                    pass
+
+            self.log("已发送冲刺模式提醒推送")
+
+        except Exception as e:
+            self.log("冲刺推送失败: %s" % e)
+
+    def _is_visible(self):
+        try:
             if not self.frame.winfo_exists():
                 return False
 
-            # 找到该 frame 的 root notebook
-            parent = self.frame.nametowidget(self.frame.winfo_parent())
-            # 往上找 notebook
-            while parent is not None:
+            # 找到最外层 BV notebook
+            p = self.frame
+            outer_tab = None
+            while True:
+                parent = p.nametowidget(p.winfo_parent())
                 if isinstance(parent, ttk.Notebook):
-                    # 当前选中的 tab
-                    current = parent.select()
-                    return str(self.frame) == str(current)
-                parent = parent.nametowidget(parent.winfo_parent())
+                    outer_tab = parent
+                    break
+                p = parent
+
+            if outer_tab is None:
+                return True  # 默认可见
+
+            current = outer_tab.select()
+
+            # outer_tab 中你的 tab 是 SingleMonitor.frame 的上一级
+            my_tab = self.frame.master
+
+            return str(my_tab) == str(current)
+
         except Exception:
-            pass
-        return True
+            return True
+
