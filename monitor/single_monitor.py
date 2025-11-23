@@ -1,4 +1,3 @@
-# monitor/single_monitor.py
 import threading
 import datetime
 import json
@@ -16,12 +15,6 @@ from .chart_widget import ChartWidget
 from .cover_widget import CoverWidget
 
 class SingleMonitor:
-    """
-    Single BV monitor that:
-      - autosaves cover to <BV>/cover.jpg on first fetch
-      - supports per-monitor interval
-      - supports manual push that includes cover image as forward node (NapCat)
-    """
     def __init__(self, parent_frame, bv, get_global_interval, on_log, obot_client=None):
         self.parent_frame = parent_frame
         self.bv = bv
@@ -37,6 +30,8 @@ class SingleMonitor:
         self.last_view = None
         self.first_fetch = True
         self.check_10m_mode = False
+        self.special_push_done = False
+        self._load_state()  # 距目标≤500播放特殊推送
 
         self.max_points = tk.IntVar(value=20)
         self.interval_var = tk.StringVar(value="")
@@ -52,11 +47,117 @@ class SingleMonitor:
         self.frame = ttk.Frame(frame)
         self.frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+        # Left column: fixed estimate block on top, then a scrollable container that contains
+        # monitoring details AND cover (so they scroll together)
         left_col = ttk.Frame(self.frame, width=260)
-        left_col.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
-        self.cover_widget = CoverWidget(left_col, on_log=self.on_log)
-        ttk.Button(left_col, text="保存封面", command=self.save_cover).pack(fill=tk.X, pady=(6, 0))
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, padx=(0, 6), expand=False)
 
+        # ---------- 预计信息 (固定，不随滚动) ----------
+        est_block = ttk.LabelFrame(left_col, text="预计信息", padding=(6,6))
+        est_block.pack(fill=tk.X, pady=(0, 8))
+
+        self._est_time_var = tk.StringVar(value="未计算")
+        self._est_date_var = tk.StringVar(value="未计算")
+        self._est_count_var = tk.StringVar(value="0")
+
+        ttk.Label(est_block, text="预计达到目标时间:").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_time_var).grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+        ttk.Label(est_block, text="预计达到目标日期:").grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_date_var).grid(row=1, column=1, sticky=tk.W, padx=(6,0))
+        ttk.Label(est_block, text="(基于N个有效采样点):").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_count_var).grid(row=2, column=1, sticky=tk.W, padx=(6,0))
+
+        # ---------- 监控信息（滚动区），此区域包含详细数据和封面（两者一起滚动） ----------
+        scroll_container = ttk.Frame(left_col)
+        scroll_container.pack(fill=tk.BOTH, expand=True)
+
+        summary_canvas = tk.Canvas(scroll_container, highlightthickness=0)
+        summary_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=summary_canvas.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        summary_canvas.configure(yscrollcommand=scrollbar.set)
+
+        # inner frame inside canvas
+        self.summary_frame = ttk.Frame(summary_canvas)
+        summary_window = summary_canvas.create_window((0, 0), window=self.summary_frame, anchor="nw")
+
+        def _on_summary_configure(event):
+            summary_canvas.configure(scrollregion=summary_canvas.bbox("all"))
+        self.summary_frame.bind("<Configure>", _on_summary_configure)
+
+        def _resize_canvas(event):
+            try:
+                summary_canvas.itemconfigure(summary_window, width=event.width)
+            except Exception:
+                pass
+        summary_canvas.bind("<Configure>", _resize_canvas)
+
+        # mousewheel support
+        def _on_mousewheel(event):
+            # cross-platform handling
+            try:
+                if event.num == 4:
+                    summary_canvas.yview_scroll(-1, "units")
+                elif event.num == 5:
+                    summary_canvas.yview_scroll(1, "units")
+                else:
+                    # Windows and Mac provide event.delta
+                    delta = int(event.delta)
+                    # On Windows delta is multiple of 120
+                    step = -1 * int(delta/120) if delta % 120 == 0 else -1 * int(delta/3)
+                    summary_canvas.yview_scroll(step, "units")
+            except Exception:
+                pass
+
+        # Bindings (support many environments)
+        summary_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        summary_canvas.bind_all("<Button-4>", _on_mousewheel)
+        summary_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        # Build summary layout (inside the scrollable frame)
+        self._summary_vars = {}
+
+        # Title (own row)
+        ttk.Label(self.summary_frame, text="视频标题:", font=(None, 9, "bold")).grid(row=0, column=0, sticky=tk.W, pady=(4,2))
+        self._summary_vars["视频标题"] = tk.StringVar(value="-")
+        ttk.Label(self.summary_frame, textvariable=self._summary_vars["视频标题"], wraplength=220, justify=tk.LEFT).grid(row=0, column=1, columnspan=2, sticky=tk.W)
+
+        # Data time (own row)
+        ttk.Label(self.summary_frame, text="数据时间:").grid(row=1, column=0, sticky=tk.W)
+        self._summary_vars["数据时间"] = tk.StringVar(value="-")
+        ttk.Label(self.summary_frame, textvariable=self._summary_vars["数据时间"]).grid(row=1, column=1, columnspan=2, sticky=tk.W)
+
+        # separator
+        ttk.Separator(self.summary_frame, orient=tk.HORIZONTAL).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6,6))
+
+        # left & right metrics
+        left_labels = ["播放数", "点赞", "硬币", "评论"]
+        right_labels = ["收藏", "分享", "弹幕", "播放量增量", "平均增量"]
+
+        for i, key in enumerate(left_labels, start=3):
+            ttk.Label(self.summary_frame, text=f"{key}:").grid(row=i, column=0, sticky=tk.W, padx=(0,4))
+            var = tk.StringVar(value="-")
+            ttk.Label(self.summary_frame, textvariable=var).grid(row=i, column=1, sticky=tk.W)
+            self._summary_vars[key] = var
+
+        right_block = ttk.Frame(self.summary_frame)
+        right_block.grid(row=3, column=2, rowspan=len(right_labels)+1, padx=(12,0), sticky=tk.N)
+
+        for j, key in enumerate(right_labels):
+            ttk.Label(right_block, text=f"{key}:").grid(row=j, column=0, sticky=tk.W, padx=(0,4))
+            var = tk.StringVar(value="-")
+            ttk.Label(right_block, textvariable=var).grid(row=j, column=1, sticky=tk.W)
+            self._summary_vars[key] = var
+
+        # ---------- 封面（放在可滚动区域的底部，与上面的详细数据一起滚动） ----------
+        cover_holder = ttk.Frame(self.summary_frame)
+        cover_holder.grid(row=3 + max(len(left_labels), len(right_labels)) + 2, column=0, columnspan=3, sticky="ew", pady=(8,0))
+        self.cover_widget = CoverWidget(cover_holder, on_log=self.on_log)
+        ttk.Button(cover_holder, text="保存封面", command=self.save_cover).pack(fill=tk.X, pady=(6, 0))
+
+        # Right column: controls + charts (unchanged)
         right_col = ttk.Frame(self.frame)
         right_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
@@ -114,6 +215,8 @@ class SingleMonitor:
         self.chart_coin = ChartWidget(self.tab_coin, f"{self.bv} - 投币", "投币", self.max_points)
         self.chart_danmaku = ChartWidget(self.tab_danmaku, f"{self.bv} - 弹幕", "弹幕", self.max_points)
 
+    # (rest of the methods remain unchanged)
+
     def apply_local_interval(self):
         with self._btn_lock:
             if self._btn_busy:
@@ -145,6 +248,9 @@ class SingleMonitor:
         except Exception:
             pass
         return self.get_global_interval()
+
+    # The rest of the class methods are identical to the original implementation; for brevity
+    # they are omitted here in the canvas version but in your working file please keep them.
 
     def start(self):
         with self._btn_lock:
@@ -259,6 +365,19 @@ class SingleMonitor:
             danmaku = stat.get("danmaku", 0)
             tms = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+            # sprint mode / special notify
+            target_view = 10_000_000 if self.check_10m_mode else 1_000_000
+            remaining = target_view - view
+
+            if remaining <= 500 and remaining > 0:
+                if self.get_interval() != 10:
+                    self.effective_interval_var.set(10)
+                    self.log("进入冲刺模式：距离目标 <=500 播放，间隔已临时降至 10 秒")
+                if not self.special_push_done:
+                    self.special_push_done = True
+                    self._notify_special_remaining(remaining, view, target_view)
+                    self._save_state()
+
             with self._lock:
                 if self.last_view is None:
                     view_inc = 0
@@ -266,10 +385,13 @@ class SingleMonitor:
                     view_inc = view - self.last_view
                 self.last_view = view
 
-            target_view = 10_000_000 if self.check_10m_mode else 1_000_000
             est_str, est_date, sc, avg_inc = self.calculate_estimated_time(self.data, view, target_view)
 
-            self.frame.after(0, self._update_ui, view_inc, est_date)
+            # UI update
+            try:
+                self.frame.after(0, self._update_ui, view_inc, est_date)
+            except Exception:
+                pass
 
             rec = {
                 "time": tms,
@@ -298,7 +420,7 @@ class SingleMonitor:
 
             self.log("样本: view=%s inc=%s like=%s coin=%s danmaku=%s" % (view, view_inc, like, coin, danmaku))
 
-            # milestone detect
+            # milestone
             if self.first_fetch:
                 self.first_fetch = False
                 if view >= 1_000_000:
@@ -326,6 +448,42 @@ class SingleMonitor:
         try:
             self.inc_lbl.config(text=str(inc))
             self.est_lbl.config(text=est)
+
+            with self._lock:
+                last = self.data[-1] if self.data else None
+
+            if last:
+                title = ""
+                try:
+                    if isinstance(self.latest_info, dict):
+                        title = self.latest_info.get("title") or self.latest_info.get("name") or ""
+                except Exception:
+                    title = ""
+                if not title:
+                    title = self.bv
+
+                # title + data time
+                self._summary_vars["视频标题"].set(title)
+                self._summary_vars["数据时间"].set(last.get("time", "-"))
+
+                # left metrics
+                self._summary_vars["播放数"].set(str(last.get("view", 0)))
+                self._summary_vars["点赞"].set(str(last.get("like", 0)))
+                self._summary_vars["硬币"].set(str(last.get("coin", 0)))
+                self._summary_vars["评论"].set(str(last.get("reply", 0)))
+
+                # right metrics
+                self._summary_vars["收藏"].set(str(last.get("favorite", 0)))
+                self._summary_vars["分享"].set(str(last.get("share", 0)))
+                self._summary_vars["弹幕"].set(str(last.get("danmaku", 0)))
+                self._summary_vars["播放量增量"].set(str(last.get("view_increment", 0)))
+                self._summary_vars["平均增量"].set(str(last.get("avg_increment_per_interval", 0)))
+
+                # estimates
+                self._est_time_var.set(last.get("estimated_time", "未计算"))
+                self._est_date_var.set(last.get("estimated_date", "未计算"))
+                self._est_count_var.set(str(last.get("sample_count", 0)))
+
         except Exception:
             pass
 
@@ -349,7 +507,6 @@ class SingleMonitor:
         self.chart_danmaku.update(dans)
 
     def save_cover(self):
-        # save current cover image from cover_widget if loaded
         if not getattr(self.cover_widget, "_cover_image_pil", None):
             messagebox.showinfo("提示", "封面尚未加载")
             return
@@ -507,7 +664,6 @@ class SingleMonitor:
             if not title:
                 title = self.bv
 
-            # 构造文本（保持全部换行在单个 text 段中）
             text = (
                 "视频标题:%s\n"
                 "视频bv号:%s\n"
@@ -564,7 +720,6 @@ class SingleMonitor:
             group_ids = normalize_list(group_ids)
             user_ids = normalize_list(user_ids)
 
-            # build forward node for this BV: use single text segment that contains \n
             bot_qq = str(cfg.get("onebot_bot_qq") or cfg.get("bot_qq") or 0)
 
             node_content = [
@@ -611,6 +766,153 @@ class SingleMonitor:
                 self._btn_busy = False
 
     def _notify_milestone(self, target, view):
+        """
+        里程碑推送：内容格式完全与手动推送一致
+        唯一区别：预计达成 → 已达成
+        """
+        try:
+            if not self.obot_client:
+                return
+            cfg = self.obot_client.get_config() or {}
+            if not cfg.get("onebot_enabled", False):
+                return
+
+            # ---- 取推送目标 ----
+            group_ids = cfg.get("onebot_group_ids") or cfg.get("onebot_group_id") or []
+            user_ids = cfg.get("onebot_user_ids") or cfg.get("onebot_user_id") or []
+
+            def normalize_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, (list, tuple)):
+                    return [int(i) for i in x if str(i).strip()]
+                s = str(x).strip()
+                if not s:
+                    return []
+                parts = [p.strip() for p in s.split(",") if p.strip()]
+                out = []
+                for p in parts:
+                    try:
+                        out.append(int(p))
+                    except:
+                        continue
+                return out
+
+            group_ids = normalize_list(group_ids)
+            user_ids = normalize_list(user_ids)
+            bot_qq = str(cfg.get("onebot_bot_qq") or 0)
+
+            # ---- 读取最新数据 ----
+            with self._lock:
+                last = self.data[-1] if self.data else None
+
+            if not last:
+                return
+
+            title = ""
+            try:
+                title = (
+                    self.latest_info.get("title")
+                    if isinstance(self.latest_info, dict)
+                    else self.bv
+                )
+            except:
+                title = self.bv
+
+            like = last.get("like", 0)
+            coin = last.get("coin", 0)
+            reply = last.get("reply", 0)
+            share = last.get("share", 0)
+            danmaku = last.get("danmaku", 0)
+            favorite = last.get("favorite", 0)
+            sampling_time = last.get("time", "-")
+            view_inc = last.get("view_increment", 0)
+            avg_inc = last.get("avg_increment_per_interval", 0)
+            sample_count = last.get("sample_count", 0)
+
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # ---- 里程碑推送文本（完全与手动一致，但“预计”→“已达成”）----
+            text = (
+                       "【里程碑已达成】\n"
+                       "视频标题:%s\n"
+                       "视频bv号:%s\n"
+                       "播放数: %s\n"
+                       "点赞: %s\n"
+                       "硬币: %s\n"
+                       "评论: %s\n"
+                       "收藏: %s\n"
+                       "分享: %s\n"
+                       "弹幕: %s\n"
+                       "播放量增量: %s\n"
+                       "平均增量(每采样间隔): %s\n"
+                       "已达成目标时间: %s\n"
+                       "已达成目标日期: %s\n"
+                       "数据采样时间: %s\n"
+                       "(基于%d个有效采样点)"
+                   ) % (
+                       title, self.bv, view, like, coin, reply, favorite,
+                       share, danmaku, view_inc, avg_inc,
+                       now, now, sampling_time, sample_count
+                   )
+
+            node_content = [{"type": "text", "data": {"text": text}}]
+
+            # ---- 封面 ----
+            cover_path = self.get_cover_path()
+            if cover_path and os.path.exists(cover_path):
+                try:
+                    with open(cover_path, "rb") as f:
+                        b = f.read()
+                    b64 = base64.b64encode(b).decode()
+                    node_content.append(
+                        {"type": "image", "data": {"file": "base64://" + b64}}
+                    )
+                except Exception as e:
+                    self.log("封面读取失败: %s" % e)
+
+            node = {
+                "type": "node",
+                "data": {"name": "监控器", "uin": bot_qq, "content": node_content},
+            }
+
+            # ---- 推送 ----
+            for gid in group_ids:
+                try:
+                    self.obot_client.send_group_forward(int(gid), [node])
+                except:
+                    pass
+            for uid in user_ids:
+                try:
+                    self.obot_client.send_private_forward(int(uid), [node])
+                except:
+                    pass
+
+            self.log("里程碑推送已发送")
+
+        except Exception as e:
+            self.log("里程碑通知失败: %s" % e)
+
+    def _save_state(self):
+        try:
+            folder = self.bv
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"special_push_done": self.special_push_done}, f)
+        except:
+            pass
+
+    def _load_state(self):
+        try:
+            p = os.path.join(self.bv, "state.json")
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                self.special_push_done = d.get("special_push_done", False)
+        except:
+            pass
+
+    def _notify_special_remaining(self, remaining, view, target):
         try:
             if not self.obot_client:
                 return
@@ -620,6 +922,7 @@ class SingleMonitor:
 
             group_ids = cfg.get("onebot_group_ids") or cfg.get("onebot_group_id") or []
             user_ids = cfg.get("onebot_user_ids") or cfg.get("onebot_user_id") or []
+
             def normalize_list(x):
                 if x is None:
                     return []
@@ -636,46 +939,61 @@ class SingleMonitor:
                     except Exception:
                         continue
                 return out
+
             group_ids = normalize_list(group_ids)
             user_ids = normalize_list(user_ids)
 
             bot_qq = str(cfg.get("onebot_bot_qq") or 0)
-            text = "视频 %s 已达到里程碑: %s / %s" % (self.bv, view, target)
+
+            text = (
+                f"[冲刺提醒]\n"
+                f"BV {self.bv}\n"
+                f"当前播放: {view}\n"
+                f"目标: {target}\n"
+                f"距离目标还有 {remaining} 播放！\n"
+                f"已自动切换到 10 秒采样间隔。"
+            )
 
             node_content = [{"type": "text", "data": {"text": text}}]
             node = {"type": "node", "data": {"name": "监控器", "uin": bot_qq, "content": node_content}}
+
             for gid in group_ids:
                 try:
                     self.obot_client.send_group_forward(int(gid), [node])
                 except Exception:
                     pass
+
             for uid in user_ids:
                 try:
                     self.obot_client.send_private_forward(int(uid), [node])
                 except Exception:
                     pass
-            self.log("里程碑通知已发")
+
+            self.log("已发送冲刺模式提醒推送")
+
         except Exception as e:
-            self.log("里程碑通知失败: %s" % e)
+            self.log("冲刺推送失败: %s" % e)
 
     def _is_visible(self):
-        """
-        检查当前监控器界面是否可见（所在的 tab 是否是当前选中的）
-        """
         try:
-            # 如果 frame 被销毁，不可见
             if not self.frame.winfo_exists():
                 return False
 
-            # 找到该 frame 的 root notebook
-            parent = self.frame.nametowidget(self.frame.winfo_parent())
-            # 往上找 notebook
-            while parent is not None:
+            p = self.frame
+            outer_tab = None
+            while True:
+                parent = p.nametowidget(p.winfo_parent())
                 if isinstance(parent, ttk.Notebook):
-                    # 当前选中的 tab
-                    current = parent.select()
-                    return str(self.frame) == str(current)
-                parent = parent.nametowidget(parent.winfo_parent())
+                    outer_tab = parent
+                    break
+                p = parent
+
+            if outer_tab is None:
+                return True
+
+            current = outer_tab.select()
+            my_tab = self.frame.master
+            return str(my_tab) == str(current)
+
         except Exception:
-            pass
-        return True
+            return True

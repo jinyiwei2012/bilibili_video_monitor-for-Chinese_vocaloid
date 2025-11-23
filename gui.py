@@ -3,17 +3,16 @@ import os
 import json
 import datetime
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext,font
+from tkinter import ttk, messagebox, scrolledtext, font
 import matplotlib
 matplotlib.rcParams['font.family'] = 'sans-serif'
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
-
 from monitor import SingleMonitor, OneBotWSClient
 
 CONFIG_FILE = "bili_monitor_config.json"
-DEFAULT_BOT_QQ = 3807093079  # 由你提供
+DEFAULT_BOT_QQ = 3807093079  # 由你提供或修改为实际值
 
 def load_config():
     cfg = {}
@@ -46,11 +45,17 @@ class BiliVideoMonitorGUI:
 
         self.obot_client = OneBotWSClient(lambda: self.config, on_log=self._log)
         if self.config.get("onebot_enabled", False) and self.config.get("onebot_ws_url"):
-            self.obot_client.start()
+            try:
+                self.obot_client.start()
+            except Exception:
+                pass
 
-        self.monitors = {}
+        self.monitors = {}  # bv -> SingleMonitor
 
         self._build_ui()
+
+        # load persisted BV list and restore tabs/monitors (do not auto-start)
+        self._restore_persisted_bvs()
 
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=8)
@@ -139,30 +144,114 @@ class BiliVideoMonitorGUI:
         if bv in self.monitors:
             messagebox.showwarning("提示", "该 BV 已添加")
             return
-        self.bv_listbox.insert(tk.END, bv)
 
+        # create tab (this frame acts as the notebook tab id)
         tab = ttk.Frame(self.bv_notebook)
         self.bv_notebook.add(tab, text=bv)
 
+        # add to listbox
+        self.bv_listbox.insert(tk.END, bv)
+
+        # create monitor with parent_frame == tab
         monitor = SingleMonitor(tab, bv, self.get_interval, self._log, obot_client=self.obot_client)
         self.monitors[bv] = monitor
+
+        # persist the bv to config
+        try:
+            bvs = self.config.get("monitored_bvs", [])
+            if not isinstance(bvs, list):
+                bvs = []
+            if bv not in bvs:
+                bvs.append(bv)
+                self.config["monitored_bvs"] = bvs
+                save_config(self.config)
+        except Exception as e:
+            self._log("保存 monitored_bvs 失败: %s" % e)
+
         self._log("已添加 %s" % bv)
+
+    def _restore_bv(self, bv):
+        """从持久化配置恢复 BV 监控和大tab（不自动开始监控）"""
+        if bv in self.monitors:
+            return
+        tab = ttk.Frame(self.bv_notebook)
+        self.bv_notebook.add(tab, text=bv)
+        self.bv_listbox.insert(tk.END, bv)
+
+        monitor = SingleMonitor(tab, bv, self.get_interval, self._log, obot_client=self.obot_client)
+        self.monitors[bv] = monitor
+        self._log("已从配置恢复监控: %s" % bv)
+
+    def _restore_persisted_bvs(self):
+        bvs = self.config.get("monitored_bvs", []) or []
+        if not isinstance(bvs, (list, tuple)):
+            return
+        for bv in bvs:
+            try:
+                self._restore_bv(bv)
+            except Exception as e:
+                self._log("恢复 BV %s 失败: %s" % (bv, e))
 
     def remove_selected(self):
         sel = self.bv_listbox.curselection()
         if not sel:
             messagebox.showwarning("提示", "请先选中")
             return
+
         for idx in reversed(sel):
             bv = self.bv_listbox.get(idx)
+            # stop monitor if running
             if bv in self.monitors:
                 try:
                     self.monitors[bv].stop()
-                    self.monitors[bv].frame.destroy()
                 except Exception:
                     pass
-                del self.monitors[bv]
-            self.bv_listbox.delete(idx)
+
+                # the tab in the outer notebook is the parent_frame passed to SingleMonitor
+                try:
+                    parent_tab = self.monitors[bv].parent_frame
+                    # forget from notebook
+                    try:
+                        self.bv_notebook.forget(parent_tab)
+                    except Exception as e:
+                        self._log("移除 Tab 失败 (forget) %s: %s" % (bv, e))
+                    # destroy parent tab widget
+                    try:
+                        parent_tab.destroy()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    self._log("移除 Tab 失败 (获取 parent_frame) %s: %s" % (bv, e))
+
+                # destroy internal monitor frame (if exists)
+                try:
+                    if hasattr(self.monitors[bv], "frame") and self.monitors[bv].frame.winfo_exists():
+                        self.monitors[bv].frame.destroy()
+                except Exception:
+                    pass
+
+                # finally remove from monitors dict
+                try:
+                    del self.monitors[bv]
+                except Exception:
+                    pass
+
+            # listbox remove
+            try:
+                self.bv_listbox.delete(idx)
+            except Exception:
+                pass
+
+            # remove from persisted config
+            try:
+                bvs = self.config.get("monitored_bvs", []) or []
+                if bv in bvs:
+                    bvs.remove(bv)
+                    self.config["monitored_bvs"] = bvs
+                    save_config(self.config)
+            except Exception as e:
+                self._log("从配置移除 %s 失败: %s" % (bv, e))
+
             self._log("已移除 %s" % bv)
 
     def start_selected(self):
@@ -173,7 +262,10 @@ class BiliVideoMonitorGUI:
         for idx in sel:
             bv = self.bv_listbox.get(idx)
             if bv in self.monitors:
-                self.monitors[bv].start()
+                try:
+                    self.monitors[bv].start()
+                except Exception as e:
+                    self._log("启动 %s 失败: %s" % (bv, e))
 
     def stop_selected(self):
         sel = self.bv_listbox.curselection()
@@ -183,15 +275,24 @@ class BiliVideoMonitorGUI:
         for idx in sel:
             bv = self.bv_listbox.get(idx)
             if bv in self.monitors:
-                self.monitors[bv].stop()
+                try:
+                    self.monitors[bv].stop()
+                except Exception as e:
+                    self._log("停止 %s 失败: %s" % (bv, e))
 
     def start_all(self):
-        for m in self.monitors.values():
-            m.start()
+        for m in list(self.monitors.values()):
+            try:
+                m.start()
+            except Exception as e:
+                self._log("start_all 某监控启动失败: %s" % e)
 
     def stop_all(self):
-        for m in self.monitors.values():
-            m.stop()
+        for m in list(self.monitors.values()):
+            try:
+                m.stop()
+            except Exception as e:
+                self._log("stop_all 某监控停止失败: %s" % e)
 
     # interval
     def get_interval(self):
@@ -292,8 +393,11 @@ class BiliVideoMonitorGUI:
         for m in self.monitors.values():
             m.obot_client = self.obot_client
         if enabled and url:
-            self.obot_client.start()
-            self._log("OneBot 客户端已启动（WebSocket）")
+            try:
+                self.obot_client.start()
+                self._log("OneBot 客户端已启动（WebSocket）")
+            except Exception as e:
+                self._log("OneBot 启动失败: %s" % e)
         else:
             self._log("OneBot 未启用或 URL 为空（已保存配置）")
 
