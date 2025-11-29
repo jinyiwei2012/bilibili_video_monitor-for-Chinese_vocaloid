@@ -86,7 +86,7 @@ Python **3.8**
 ### 依赖安装
 
 ```bash
-pip install bilibili-api-python pillow requests websockets matplotlib pandas openpyxl
+pip install bilibili-api-python pillow requests websockets matplotlib pandas openpyxl scikit-learn
 ```
 
 ---
