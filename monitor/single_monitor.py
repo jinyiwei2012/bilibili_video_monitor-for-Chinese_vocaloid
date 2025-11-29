@@ -10,10 +10,13 @@ import pandas as pd
 import asyncio
 import requests
 import base64
-
+import numpy as np
+import datetime
+from statistics import median
+from sklearn.linear_model import RANSACRegressor, LinearRegression
 from .chart_widget import ChartWidget
 from .cover_widget import CoverWidget
-
+import math
 class SingleMonitor:
     def __init__(self, parent_frame, bv, get_global_interval, on_log, obot_client=None):
         self.parent_frame = parent_frame
@@ -587,42 +590,220 @@ class SingleMonitor:
         return datetime.datetime.strptime(tstr, "%Y-%m-%d %H:%M:%S")
 
     def calculate_estimated_time(self, data, current_view, target_view):
-        if len(data) < 2:
-            return "数据不足", "数据不足", 0, 0
-        valid = []
-        total_time = 0
-        total_inc = 0
-        min_int = max(1, self.get_interval() * 0.5)
-        max_int = max(1, self.get_interval() * 2)
-        for i in range(1, len(data)):
+        """
+        增强版预测模型：
+        1. RANSAC 回归（主模型）
+        2. 分段线性回归（自动寻找最佳分段点）
+        3. 指数衰减增量预测（对未来增量趋势进行校正）
+        4. 动态权重融合
+        5. 基于局部“斜率”而非增量(diff)的异常过滤
+        """
+
+        # ------------------------------
+        # 0. 数据准备
+        # ------------------------------
+        if len(data) < 6:
+            return "数据不足", "数据不足", len(data), 0
+
+        xs, ys = [], []
+
+        try:
+            t0 = self.parse_time(data[0]["time"])
+        except:
+            return "时间格式错误", "时间格式错误", 0, 0
+
+        for rec in data:
             try:
-                td = (self.parse_time(data[i]["time"]) - self.parse_time(data[i - 1]["time"])) .total_seconds()
-            except Exception:
-                continue
-            if min_int <= td <= max_int:
-                valid.append({"time_span": td, "view_increment": data[i].get("view_increment", 0)})
-                total_time += td
-                total_inc += data[i].get("view_increment", 0)
-        if not valid:
-            return "有效数据不足", "有效数据不足", 0, 0
-        avg_sec = total_inc / total_time if total_time > 0 else 0
-        avg_interval = total_inc / len(valid) if valid else 0
-        if avg_sec <= 0:
-            return "增量非正", "增量非正", len(valid), avg_interval
-        remaining = target_view - current_view
-        if remaining <= 0:
-            return "已达成", "已达成", len(valid), avg_interval
-        est_seconds = remaining / avg_sec
-        est_date = datetime.datetime.now() + datetime.timedelta(seconds=est_seconds)
-        est_date_str = est_date.strftime("%Y-%m-%d %H:%M:%S")
-        if est_seconds < 60:
-            return "约%d秒" % (est_seconds), est_date_str, len(valid), avg_interval
-        elif est_seconds < 3600:
-            return "约%.1f分钟" % (est_seconds/60.0), est_date_str, len(valid), avg_interval
-        elif est_seconds < 86400:
-            return "约%.1f小时" % (est_seconds/3600.0), est_date_str, len(valid), avg_interval
+                t = (self.parse_time(rec["time"]) - t0).total_seconds()
+                v = rec.get("view", 0)
+                if t >= 0 and v >= 0:
+                    xs.append(t)
+                    ys.append(v)
+            except:
+                pass
+
+        xs = np.array(xs, dtype=float)
+        ys = np.array(ys, dtype=float)
+
+        if len(xs) < 6:
+            return "有效数据不足", "有效数据不足", len(xs), 0
+
+        # ------------------------------
+        # 1. 异常过滤（基于局部斜率 slope）
+        # ------------------------------
+        slopes = np.diff(ys) / np.diff(xs)
+        if len(slopes) >= 5:
+            med = median(slopes)
+            mad = median(abs(slopes - med)) or 1
+            threshold = mad * 6
+
+            mask = [True]
+            for sl in slopes:
+                mask.append(abs(sl - med) <= threshold)
+
+            xs = xs[mask]
+            ys = ys[mask]
+
+            if len(xs) < 6:
+                return "有效数据不足", "有效数据不足", len(xs), med
+
+        # ------------------------------
+        # 2. RANSAC（主模型）
+        # ------------------------------
+        try:
+            base = LinearRegression(fit_intercept=True)
+            ransac = RANSACRegressor(
+                base,
+                min_samples=max(4, len(xs) // 5),
+                residual_threshold=np.std(ys) * 0.8,
+                max_trials=100
+            )
+            ransac.fit(xs.reshape(-1, 1), ys)
+
+            a_r = ransac.estimator_.coef_[0]
+            b_r = ransac.estimator_.intercept_
+        except:
+            return "RANSAC失败", "RANSAC失败", len(xs), 0
+
+        if a_r <= 0:
+            return "增量非正", "增量非正", len(xs), 0
+
+        # ------------------------------
+        # 3. 分段线性回归（自动寻找最佳分段点）
+        # ------------------------------
+        def segment_fit(xs, ys, k):
+            """
+            给定分段点 k，拟合两段直线，返回总误差（SSE）
+            """
+            try:
+                # 第一段
+                A1 = np.vstack([xs[:k], np.ones(k)]).T
+                p1 = np.linalg.lstsq(A1, ys[:k], rcond=None)[0]
+
+                # 第二段
+                A2 = np.vstack([xs[k:], np.ones(len(xs) - k)]).T
+                p2 = np.linalg.lstsq(A2, ys[k:], rcond=None)[0]
+
+                # 计算误差
+                pred1 = A1 @ p1
+                pred2 = A2 @ p2
+                sse = np.sum((ys[:k] - pred1) ** 2) + np.sum((ys[k:] - pred2) ** 2)
+
+                return sse, p1, p2
+            except:
+                return 1e18, None, None
+
+        best_sse = 1e18
+        best_p1 = best_p2 = None
+
+        # 分段点 k 至少在 20% ~ 80% 之间
+        for k in range(int(len(xs) * 0.2), int(len(xs) * 0.8)):
+            sse, p1, p2 = segment_fit(xs, ys, k)
+            if sse < best_sse:
+                best_sse = sse
+                best_p1, best_p2 = p1, p2
+
+        # 使用第二段斜率作为“局部趋势”
+        if best_p2 is not None:
+            a_seg = best_p2[0]
+            b_seg = best_p2[1]
         else:
-            return "约%.1f天" % (est_seconds/86400.0), est_date_str, len(valid), avg_interval
+            a_seg = a_r
+            b_seg = b_r
+
+        if a_seg <= 0:
+            a_seg = a_r
+
+        # ------------------------------
+        # 4. 指数衰减模型（预测未来增量下降趋势）
+        # ------------------------------
+        incs = np.diff(ys)
+        if len(incs) > 5:
+            # 最近 5 个增量的衰减速度
+            recent = incs[-5:]
+            ratios = []
+            for i in range(1, len(recent)):
+                if recent[i - 1] > 0:
+                    ratios.append(recent[i] / recent[i - 1])
+
+            decay = np.median(ratios) if ratios else 1.0
+            decay = max(0.80, min(decay, 1.0))  # 限制在 0.80~1.0 比较稳健
+        else:
+            decay = 1.0
+
+        # 当前增量估计
+        current_inc = incs[-1] if len(incs) else 0
+        if current_inc <= 0:
+            current_inc = a_r  # fallback
+
+        # 预估达成需要的时间（指数衰减积分）
+        remain = target_view - current_view
+        if remain <= 0:
+            return "已达成", "已达成", len(xs), current_inc
+
+        # 指数衰减求解：sum(current_inc * decay^t) >= remain
+        try:
+            if decay < 0.999:
+                est_exp = math.log(1 - remain * (1 - decay) / current_inc) / math.log(decay)
+                est_exp = max(est_exp, 0)
+            else:
+                est_exp = remain / current_inc
+        except:
+            est_exp = remain / max(current_inc, 1)
+
+        # ------------------------------
+        # 5. 三模型融合（动态权重）
+        # ------------------------------
+
+        # ① RANSAC 预测
+        est_r = (target_view - current_view) / a_r
+
+        # ② 分段线性预测
+        est_s = (target_view - current_view) / a_seg
+
+        # ③ 指数衰减预测
+        est_e = est_exp
+
+        # --- 动态权重 ---
+        # 模型稳定性指标
+        inlier_ratio = ransac.inlier_mask_.mean()
+        slope_stab = 1 / (np.std(incs[-5:]) + 1e-6)
+
+        # RANSAC权重随内点比例变化
+        w_r = min(0.85, 0.4 + inlier_ratio)
+
+        # 分段线性在“后期”趋势明显时更重
+        w_s = min(0.4, slope_stab * 0.25)
+
+        # 指数衰减主要防止后期过度乐观
+        w_e = 1 - w_r - w_s
+        w_e = max(0.05, w_e)
+
+        # 融合
+        est_seconds = w_r * est_r + w_s * est_s + w_e * est_e
+
+        if est_seconds < 0:
+            return "已达成", "已达成", len(xs), current_inc
+
+        # ------------------------------
+        # 6. 输出格式化
+        # ------------------------------
+        est_dt = datetime.datetime.now() + datetime.timedelta(seconds=est_seconds)
+        est_date = est_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        if est_seconds < 60:
+            human = f"约{int(est_seconds)}秒"
+        elif est_seconds < 3600:
+            human = f"约{est_seconds / 60:.1f}分钟"
+        elif est_seconds < 86400:
+            human = f"约{est_seconds / 3600:.1f}小时"
+        else:
+            human = f"约{est_seconds / 86400:.1f}天"
+
+        # 平均增量
+        avg_inc = np.mean(incs[incs >= 0]) if len(incs) else 0
+
+        return human, est_date, len(xs), avg_inc
 
     def manual_push(self):
         """
