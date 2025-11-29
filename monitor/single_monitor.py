@@ -62,6 +62,15 @@ class SingleMonitor:
         self._est_time_var = tk.StringVar(value="未计算")
         self._est_date_var = tk.StringVar(value="未计算")
         self._est_count_var = tk.StringVar(value="0")
+        self._est_ransac_var = tk.StringVar(value="-")
+        self._est_segment_var = tk.StringVar(value="-")
+
+        ttk.Label(est_block, text="RANSAC预测:").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_ransac_var).grid(row=3, column=1, sticky=tk.W)
+
+        ttk.Label(est_block, text="分段线性预测:").grid(row=4, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_segment_var).grid(row=4, column=1, sticky=tk.W)
+
 
         ttk.Label(est_block, text="预计达到目标时间:").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(est_block, textvariable=self._est_time_var).grid(row=0, column=1, sticky=tk.W, padx=(6,0))
@@ -388,7 +397,10 @@ class SingleMonitor:
                     view_inc = view - self.last_view
                 self.last_view = view
 
-            est_str, est_date, sc, avg_inc = self.calculate_estimated_time(self.data, view, target_view)
+            (
+                est_str, est_date, sc, avg_inc,
+                est_r_time, est_s_time, est_e_time
+            ) = self.calculate_estimated_time(self.data, view, target_view)
 
             # UI update
             try:
@@ -409,7 +421,9 @@ class SingleMonitor:
                 "avg_increment_per_interval": avg_inc,
                 "estimated_time": est_str,
                 "estimated_date": est_date,
-                "sample_count": sc
+                "sample_count": sc,
+                "est_ransac": est_r_time,
+                "est_segment": est_s_time,
             }
 
             with self._lock:
@@ -486,6 +500,8 @@ class SingleMonitor:
                 self._est_time_var.set(last.get("estimated_time", "未计算"))
                 self._est_date_var.set(last.get("estimated_date", "未计算"))
                 self._est_count_var.set(str(last.get("sample_count", 0)))
+                self._est_ransac_var.set(last.get("est_ransac", "-"))
+                self._est_segment_var.set(last.get("est_segment", "-"))
 
         except Exception:
             pass
@@ -803,7 +819,30 @@ class SingleMonitor:
         # 平均增量
         avg_inc = np.mean(incs[incs >= 0]) if len(incs) else 0
 
-        return human, est_date, len(xs), avg_inc
+        # --- 格式化三个模型的时间 ---
+        def fmt(sec):
+            if sec < 60:
+                return f"{int(sec)}秒"
+            elif sec < 3600:
+                return f"{sec / 60:.1f}分钟"
+            elif sec < 86400:
+                return f"{sec / 3600:.1f}小时"
+            else:
+                return f"{sec / 86400:.1f}天"
+
+        r_time = fmt(est_r)
+        s_time = fmt(est_s)
+        e_time = fmt(est_e)
+
+        return (
+            human,  # 综合预测
+            est_date,  # 综合预测日期
+            len(xs),  # 样本数量
+            avg_inc,  # 平均增量
+            r_time,  # << 新增：RANSAC 预测时间文本
+            s_time,  # << 新增：分段线性预测时间文本
+            e_time  # << 新增：指数衰减预测时间文本
+        )
 
     def manual_push(self):
         """
@@ -834,7 +873,8 @@ class SingleMonitor:
                 valid_count = last.get("sample_count", 0)
 
             target = 10_000_000 if self.check_10m_mode else 1_000_000
-            est_str, est_date, valid_count, avg_inc = self.calculate_estimated_time(self.data, view, target)
+            (est_str, est_date, sc, avg_inc,
+             est_r_time, est_s_time, est_e_time) = self.calculate_estimated_time(self.data, view, target)
 
             title = ""
             try:
@@ -846,22 +886,32 @@ class SingleMonitor:
                 title = self.bv
 
             text = (
-                "视频标题:%s\n"
-                "视频bv号:%s\n"
-                "播放数: %s\n"
-                "点赞: %s\n"
-                "硬币: %s\n"
-                "评论: %s\n"
-                "收藏: %s\n"
-                "分享: %s\n"
-                "弹幕: %s\n"
-                "播放量增量: %s\n"
-                "平均增量(每采样间隔): %s\n"
-                "预计达到目标时间: %s\n"
-                "预计达到目标日期: %s\n"
-                "数据采样时间: %s\n"
-                "(基于%d个有效采样点)"
-            ) % (title, self.bv, view, like, coin, reply, favorite, share, danmaku, view_inc, avg_inc, est_str, est_date, sampling_time, valid_count)
+                       "视频标题:%s\n"
+                       "视频bv号:%s\n"
+                       "播放数: %s\n"
+                       "点赞: %s\n"
+                       "硬币: %s\n"
+                       "评论: %s\n"
+                       "收藏: %s\n"
+                       "分享: %s\n"
+                       "弹幕: %s\n"
+                       "播放量增量: %s\n"
+                       "平均增量: %s\n"
+                       "\n"
+                       "综合预测: %s\n"
+                       "RANSAC 预测: %s\n"
+                       "分段线性预测: %s\n"
+                       "指数衰减预测: %s\n"
+                       "预计达到目标日期: %s\n"
+                       "\n"
+                       "数据采样时间: %s\n"
+                       "(基于%d个有效采样点)"
+                   ) % (
+                       title, self.bv, view, like, coin, reply,
+                       favorite, share, danmaku, view_inc, avg_inc,
+                       est_str, est_r_time, est_s_time, est_e_time,  # << 新增
+                       est_date, sampling_time, valid_count
+                   )
 
             if not self.obot_client:
                 messagebox.showwarning("未启用 OneBot", "未配置 OneBot 客户端，无法推送")
