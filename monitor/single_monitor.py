@@ -10,7 +10,10 @@ import pandas as pd
 import asyncio
 import requests
 import base64
-
+import numpy as np
+import datetime
+from statistics import median
+from sklearn.linear_model import RANSACRegressor, LinearRegression
 from .chart_widget import ChartWidget
 from .cover_widget import CoverWidget
 
@@ -587,42 +590,168 @@ class SingleMonitor:
         return datetime.datetime.strptime(tstr, "%Y-%m-%d %H:%M:%S")
 
     def calculate_estimated_time(self, data, current_view, target_view):
-        if len(data) < 2:
-            return "数据不足", "数据不足", 0, 0
-        valid = []
-        total_time = 0
-        total_inc = 0
-        min_int = max(1, self.get_interval() * 0.5)
-        max_int = max(1, self.get_interval() * 2)
-        for i in range(1, len(data)):
+        """
+        RANSAC + 加权线性回归 + 双向回归 + 异常值剔除
+        最稳健、抗噪、快速响应的综合预测模型
+        """
+
+        # ------------------------------
+        # 至少 6 个点才使用 RANSAC
+        # ------------------------------
+        if len(data) < 6:
+            return "数据不足", "数据不足", len(data), 0
+
+        # ------------------------------
+        # 整理时间序列
+        # ------------------------------
+        xs = []
+        ys = []
+
+        try:
+            t0 = self.parse_time(data[0]["time"])
+        except:
+            return "时间格式错误", "时间格式错误", 0, 0
+
+        for rec in data:
             try:
-                td = (self.parse_time(data[i]["time"]) - self.parse_time(data[i - 1]["time"])) .total_seconds()
-            except Exception:
-                continue
-            if min_int <= td <= max_int:
-                valid.append({"time_span": td, "view_increment": data[i].get("view_increment", 0)})
-                total_time += td
-                total_inc += data[i].get("view_increment", 0)
-        if not valid:
-            return "有效数据不足", "有效数据不足", 0, 0
-        avg_sec = total_inc / total_time if total_time > 0 else 0
-        avg_interval = total_inc / len(valid) if valid else 0
-        if avg_sec <= 0:
-            return "增量非正", "增量非正", len(valid), avg_interval
-        remaining = target_view - current_view
-        if remaining <= 0:
-            return "已达成", "已达成", len(valid), avg_interval
-        est_seconds = remaining / avg_sec
-        est_date = datetime.datetime.now() + datetime.timedelta(seconds=est_seconds)
-        est_date_str = est_date.strftime("%Y-%m-%d %H:%M:%S")
-        if est_seconds < 60:
-            return "约%d秒" % (est_seconds), est_date_str, len(valid), avg_interval
-        elif est_seconds < 3600:
-            return "约%.1f分钟" % (est_seconds/60.0), est_date_str, len(valid), avg_interval
-        elif est_seconds < 86400:
-            return "约%.1f小时" % (est_seconds/3600.0), est_date_str, len(valid), avg_interval
+                t = (self.parse_time(rec["time"]) - t0).total_seconds()
+                v = rec.get("view", 0)
+                if t >= 0 and v >= 0:
+                    xs.append(t)
+                    ys.append(v)
+            except:
+                pass
+
+        xs = np.array(xs, dtype=float)
+        ys = np.array(ys, dtype=float)
+
+        if len(xs) < 6:
+            return "有效数据不足", "有效数据不足", len(xs), 0
+
+        # ------------------------------
+        # IQR + MAD 剔除异常增量
+        # ------------------------------
+        diffs = np.diff(ys)
+        if len(diffs) >= 5:
+            med = median(diffs)
+            mad = median(abs(diffs - med)) or 1
+            threshold = max(5, mad * 6)
+
+            mask = [True]
+            for d in diffs:
+                mask.append(abs(d - med) <= threshold)
+
+            xs = xs[mask]
+            ys = ys[mask]
+
+            if len(xs) < 6:
+                return "有效数据不足", "有效数据不足", len(xs), med
+
+        # ------------------------------
+        # RANSAC（主模型）
+        # ------------------------------
+        try:
+            base_model = LinearRegression(fit_intercept=True)
+            ransac = RANSACRegressor(
+                base_model,
+                min_samples=max(4, len(xs) // 5),
+                residual_threshold=np.std(ys) * 0.8,
+                max_trials=200
+            )
+            ransac.fit(xs.reshape(-1, 1), ys)
+            a1 = ransac.estimator_.coef_[0]  # 斜率
+            b1 = ransac.estimator_.intercept_  # 截距
+        except Exception:
+            return "RANSAC失败", "RANSAC失败", len(xs), 0
+
+        if a1 <= 0:
+            return "增量非正", "增量非正", len(xs), 0
+
+        # ------------------------------
+        # EWMA + 动态权重线性回归（辅助模型）
+        # ------------------------------
+        weights = []
+        max_v = max(ys)
+        min_v = min(ys) + 1e-6
+        for v in ys:
+            weights.append(0.3 + 0.7 * ((v - min_v) / (max_v - min_v)))
+
+        weights = np.array(weights)
+        alpha = 0.6
+        ew = np.ones_like(ys)
+        for i in range(1, len(ys)):
+            ew[i] = ew[i - 1] * (1 - alpha)
+
+        W = weights * ew
+        try:
+            A = np.vstack([xs, np.ones(len(xs))]).T
+            Aw = (A.T * W) @ A
+            Bw = (A.T * W) @ ys
+            a2, b2 = np.linalg.solve(Aw, Bw)
+        except:
+            a2 = b2 = None
+
+        # ------------------------------
+        # 双向回归（v→t）
+        # ------------------------------
+        try:
+            B = np.vstack([ys, np.ones(len(ys))]).T
+            Bw2 = (B.T * W) @ B
+            Cw2 = (B.T * W) @ xs
+            a3, b3 = np.linalg.solve(Bw2, Cw2)
+        except:
+            a3 = b3 = None
+
+        # ------------------------------
+        # 三模型融合（主：RANSAC）
+        # ------------------------------
+
+        # 1: RANSAC
+        est1 = (target_view - current_view) / a1 if a1 > 0 else 1e9
+
+        # 2: 加权回归
+        if a2 and a2 > 0:
+            est2 = (target_view - current_view) / a2
         else:
-            return "约%.1f天" % (est_seconds/86400.0), est_date_str, len(valid), avg_interval
+            est2 = est1
+
+        # 3: 双向回归
+        if a3 and a3 > 0:
+            target_t = a3 * target_view + b3
+            current_t = a3 * current_view + b3
+            est3 = target_t - current_t
+        else:
+            est3 = est1
+
+        # 融合：RANSAC 权重最高
+        est_seconds = est1 * 0.6 + est2 * 0.25 + est3 * 0.15
+
+        if est_seconds <= 0:
+            return "已达成", "已达成", len(xs), 0
+
+        est_dt = datetime.datetime.now() + datetime.timedelta(seconds=est_seconds)
+        est_time_str = est_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+        # 人类可读格式
+        if est_seconds < 60:
+            human = f"约{int(est_seconds)}秒"
+        elif est_seconds < 3600:
+            human = f"约{est_seconds / 60:.1f}分钟"
+            human = f"约{est_seconds / 60:.1f}分钟"
+        elif est_seconds < 86400:
+            human = f"约{est_seconds / 3600:.1f}小时"
+        else:
+            human = f"约{est_seconds / 86400:.1f}天"
+
+        # UI 显示的平均增量
+        increments = []
+        for i in range(1, len(ys)):
+            dv = ys[i] - ys[i - 1]
+            if dv >= 0:
+                increments.append(dv)
+        avg_inc = sum(increments) / len(increments) if increments else 0
+
+        return human, est_time_str, len(xs), avg_inc
 
     def manual_push(self):
         """
