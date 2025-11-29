@@ -16,7 +16,7 @@ from statistics import median
 from sklearn.linear_model import RANSACRegressor, LinearRegression
 from .chart_widget import ChartWidget
 from .cover_widget import CoverWidget
-
+import math
 class SingleMonitor:
     def __init__(self, parent_frame, bv, get_global_interval, on_log, obot_client=None):
         self.parent_frame = parent_frame
@@ -591,21 +591,21 @@ class SingleMonitor:
 
     def calculate_estimated_time(self, data, current_view, target_view):
         """
-        RANSAC + 加权线性回归 + 双向回归 + 异常值剔除
-        最稳健、抗噪、快速响应的综合预测模型
+        增强版预测模型：
+        1. RANSAC 回归（主模型）
+        2. 分段线性回归（自动寻找最佳分段点）
+        3. 指数衰减增量预测（对未来增量趋势进行校正）
+        4. 动态权重融合
+        5. 基于局部“斜率”而非增量(diff)的异常过滤
         """
 
         # ------------------------------
-        # 至少 6 个点才使用 RANSAC
+        # 0. 数据准备
         # ------------------------------
         if len(data) < 6:
             return "数据不足", "数据不足", len(data), 0
 
-        # ------------------------------
-        # 整理时间序列
-        # ------------------------------
-        xs = []
-        ys = []
+        xs, ys = [], []
 
         try:
             t0 = self.parse_time(data[0]["time"])
@@ -629,17 +629,17 @@ class SingleMonitor:
             return "有效数据不足", "有效数据不足", len(xs), 0
 
         # ------------------------------
-        # IQR + MAD 剔除异常增量
+        # 1. 异常过滤（基于局部斜率 slope）
         # ------------------------------
-        diffs = np.diff(ys)
-        if len(diffs) >= 5:
-            med = median(diffs)
-            mad = median(abs(diffs - med)) or 1
-            threshold = max(5, mad * 6)
+        slopes = np.diff(ys) / np.diff(xs)
+        if len(slopes) >= 5:
+            med = median(slopes)
+            mad = median(abs(slopes - med)) or 1
+            threshold = mad * 6
 
             mask = [True]
-            for d in diffs:
-                mask.append(abs(d - med) <= threshold)
+            for sl in slopes:
+                mask.append(abs(sl - med) <= threshold)
 
             xs = xs[mask]
             ys = ys[mask]
@@ -648,110 +648,162 @@ class SingleMonitor:
                 return "有效数据不足", "有效数据不足", len(xs), med
 
         # ------------------------------
-        # RANSAC（主模型）
+        # 2. RANSAC（主模型）
         # ------------------------------
         try:
-            base_model = LinearRegression(fit_intercept=True)
+            base = LinearRegression(fit_intercept=True)
             ransac = RANSACRegressor(
-                base_model,
+                base,
                 min_samples=max(4, len(xs) // 5),
                 residual_threshold=np.std(ys) * 0.8,
-                max_trials=200
+                max_trials=100
             )
             ransac.fit(xs.reshape(-1, 1), ys)
-            a1 = ransac.estimator_.coef_[0]  # 斜率
-            b1 = ransac.estimator_.intercept_  # 截距
-        except Exception:
+
+            a_r = ransac.estimator_.coef_[0]
+            b_r = ransac.estimator_.intercept_
+        except:
             return "RANSAC失败", "RANSAC失败", len(xs), 0
 
-        if a1 <= 0:
+        if a_r <= 0:
             return "增量非正", "增量非正", len(xs), 0
 
         # ------------------------------
-        # EWMA + 动态权重线性回归（辅助模型）
+        # 3. 分段线性回归（自动寻找最佳分段点）
         # ------------------------------
-        weights = []
-        max_v = max(ys)
-        min_v = min(ys) + 1e-6
-        for v in ys:
-            weights.append(0.3 + 0.7 * ((v - min_v) / (max_v - min_v)))
+        def segment_fit(xs, ys, k):
+            """
+            给定分段点 k，拟合两段直线，返回总误差（SSE）
+            """
+            try:
+                # 第一段
+                A1 = np.vstack([xs[:k], np.ones(k)]).T
+                p1 = np.linalg.lstsq(A1, ys[:k], rcond=None)[0]
 
-        weights = np.array(weights)
-        alpha = 0.6
-        ew = np.ones_like(ys)
-        for i in range(1, len(ys)):
-            ew[i] = ew[i - 1] * (1 - alpha)
+                # 第二段
+                A2 = np.vstack([xs[k:], np.ones(len(xs) - k)]).T
+                p2 = np.linalg.lstsq(A2, ys[k:], rcond=None)[0]
 
-        W = weights * ew
-        try:
-            A = np.vstack([xs, np.ones(len(xs))]).T
-            Aw = (A.T * W) @ A
-            Bw = (A.T * W) @ ys
-            a2, b2 = np.linalg.solve(Aw, Bw)
-        except:
-            a2 = b2 = None
+                # 计算误差
+                pred1 = A1 @ p1
+                pred2 = A2 @ p2
+                sse = np.sum((ys[:k] - pred1) ** 2) + np.sum((ys[k:] - pred2) ** 2)
 
-        # ------------------------------
-        # 双向回归（v→t）
-        # ------------------------------
-        try:
-            B = np.vstack([ys, np.ones(len(ys))]).T
-            Bw2 = (B.T * W) @ B
-            Cw2 = (B.T * W) @ xs
-            a3, b3 = np.linalg.solve(Bw2, Cw2)
-        except:
-            a3 = b3 = None
+                return sse, p1, p2
+            except:
+                return 1e18, None, None
 
-        # ------------------------------
-        # 三模型融合（主：RANSAC）
-        # ------------------------------
+        best_sse = 1e18
+        best_p1 = best_p2 = None
 
-        # 1: RANSAC
-        est1 = (target_view - current_view) / a1 if a1 > 0 else 1e9
+        # 分段点 k 至少在 20% ~ 80% 之间
+        for k in range(int(len(xs) * 0.2), int(len(xs) * 0.8)):
+            sse, p1, p2 = segment_fit(xs, ys, k)
+            if sse < best_sse:
+                best_sse = sse
+                best_p1, best_p2 = p1, p2
 
-        # 2: 加权回归
-        if a2 and a2 > 0:
-            est2 = (target_view - current_view) / a2
+        # 使用第二段斜率作为“局部趋势”
+        if best_p2 is not None:
+            a_seg = best_p2[0]
+            b_seg = best_p2[1]
         else:
-            est2 = est1
+            a_seg = a_r
+            b_seg = b_r
 
-        # 3: 双向回归
-        if a3 and a3 > 0:
-            target_t = a3 * target_view + b3
-            current_t = a3 * current_view + b3
-            est3 = target_t - current_t
+        if a_seg <= 0:
+            a_seg = a_r
+
+        # ------------------------------
+        # 4. 指数衰减模型（预测未来增量下降趋势）
+        # ------------------------------
+        incs = np.diff(ys)
+        if len(incs) > 5:
+            # 最近 5 个增量的衰减速度
+            recent = incs[-5:]
+            ratios = []
+            for i in range(1, len(recent)):
+                if recent[i - 1] > 0:
+                    ratios.append(recent[i] / recent[i - 1])
+
+            decay = np.median(ratios) if ratios else 1.0
+            decay = max(0.80, min(decay, 1.0))  # 限制在 0.80~1.0 比较稳健
         else:
-            est3 = est1
+            decay = 1.0
 
-        # 融合：RANSAC 权重最高
-        est_seconds = est1 * 0.6 + est2 * 0.25 + est3 * 0.15
+        # 当前增量估计
+        current_inc = incs[-1] if len(incs) else 0
+        if current_inc <= 0:
+            current_inc = a_r  # fallback
 
-        if est_seconds <= 0:
-            return "已达成", "已达成", len(xs), 0
+        # 预估达成需要的时间（指数衰减积分）
+        remain = target_view - current_view
+        if remain <= 0:
+            return "已达成", "已达成", len(xs), current_inc
 
+        # 指数衰减求解：sum(current_inc * decay^t) >= remain
+        try:
+            if decay < 0.999:
+                est_exp = math.log(1 - remain * (1 - decay) / current_inc) / math.log(decay)
+                est_exp = max(est_exp, 0)
+            else:
+                est_exp = remain / current_inc
+        except:
+            est_exp = remain / max(current_inc, 1)
+
+        # ------------------------------
+        # 5. 三模型融合（动态权重）
+        # ------------------------------
+
+        # ① RANSAC 预测
+        est_r = (target_view - current_view) / a_r
+
+        # ② 分段线性预测
+        est_s = (target_view - current_view) / a_seg
+
+        # ③ 指数衰减预测
+        est_e = est_exp
+
+        # --- 动态权重 ---
+        # 模型稳定性指标
+        inlier_ratio = ransac.inlier_mask_.mean()
+        slope_stab = 1 / (np.std(incs[-5:]) + 1e-6)
+
+        # RANSAC权重随内点比例变化
+        w_r = min(0.85, 0.4 + inlier_ratio)
+
+        # 分段线性在“后期”趋势明显时更重
+        w_s = min(0.4, slope_stab * 0.25)
+
+        # 指数衰减主要防止后期过度乐观
+        w_e = 1 - w_r - w_s
+        w_e = max(0.05, w_e)
+
+        # 融合
+        est_seconds = w_r * est_r + w_s * est_s + w_e * est_e
+
+        if est_seconds < 0:
+            return "已达成", "已达成", len(xs), current_inc
+
+        # ------------------------------
+        # 6. 输出格式化
+        # ------------------------------
         est_dt = datetime.datetime.now() + datetime.timedelta(seconds=est_seconds)
-        est_time_str = est_dt.strftime("%Y-%m-%d %H:%M:%S")
+        est_date = est_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-        # 人类可读格式
         if est_seconds < 60:
             human = f"约{int(est_seconds)}秒"
         elif est_seconds < 3600:
-            human = f"约{est_seconds / 60:.1f}分钟"
             human = f"约{est_seconds / 60:.1f}分钟"
         elif est_seconds < 86400:
             human = f"约{est_seconds / 3600:.1f}小时"
         else:
             human = f"约{est_seconds / 86400:.1f}天"
 
-        # UI 显示的平均增量
-        increments = []
-        for i in range(1, len(ys)):
-            dv = ys[i] - ys[i - 1]
-            if dv >= 0:
-                increments.append(dv)
-        avg_inc = sum(increments) / len(increments) if increments else 0
+        # 平均增量
+        avg_inc = np.mean(incs[incs >= 0]) if len(incs) else 0
 
-        return human, est_time_str, len(xs), avg_inc
+        return human, est_date, len(xs), avg_inc
 
     def manual_push(self):
         """
