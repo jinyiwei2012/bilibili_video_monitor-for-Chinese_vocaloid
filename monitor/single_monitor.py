@@ -64,6 +64,7 @@ class SingleMonitor:
         self._est_count_var = tk.StringVar(value="0")
         self._est_ransac_var = tk.StringVar(value="-")
         self._est_segment_var = tk.StringVar(value="-")
+        self._est_exp_var = tk.StringVar(value="-")
 
         ttk.Label(est_block, text="RANSAC预测:").grid(row=3, column=0, sticky=tk.W)
         ttk.Label(est_block, textvariable=self._est_ransac_var).grid(row=3, column=1, sticky=tk.W)
@@ -71,6 +72,8 @@ class SingleMonitor:
         ttk.Label(est_block, text="分段线性预测:").grid(row=4, column=0, sticky=tk.W)
         ttk.Label(est_block, textvariable=self._est_segment_var).grid(row=4, column=1, sticky=tk.W)
 
+        ttk.Label(est_block, text="指数衰减预测:").grid(row=5, column=0, sticky=tk.W)
+        ttk.Label(est_block, textvariable=self._est_exp_var).grid(row=5, column=1, sticky=tk.W)
 
         ttk.Label(est_block, text="预计达到目标时间:").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(est_block, textvariable=self._est_time_var).grid(row=0, column=1, sticky=tk.W, padx=(6,0))
@@ -182,6 +185,18 @@ class SingleMonitor:
         ttk.Label(info, text="预计:").grid(row=0, column=3, sticky=tk.W)
         self.est_lbl = ttk.Label(info, text="未计算")
         self.est_lbl.grid(row=0, column=4, sticky=tk.W, padx=(4, 12))
+        # ---- 在线人数显示（添加到折线图上方） ----
+        ttk.Label(info, text="总在线:").grid(row=0, column=5, sticky=tk.W, padx=(8, 0))
+        self.lbl_total_online = ttk.Label(info, text="-")
+        self.lbl_total_online.grid(row=0, column=6, sticky=tk.W, padx=(4, 12))
+
+        ttk.Label(info, text="Web:").grid(row=0, column=7, sticky=tk.W)
+        self.lbl_web_online = ttk.Label(info, text="-")
+        self.lbl_web_online.grid(row=0, column=8, sticky=tk.W, padx=(4, 12))
+
+        ttk.Label(info, text="APP:").grid(row=0, column=9, sticky=tk.W)
+        self.lbl_app_online = ttk.Label(info, text="-")
+        self.lbl_app_online.grid(row=0, column=10, sticky=tk.W, padx=(4, 12))
 
         interval_row = ttk.Frame(right_col)
         interval_row.pack(fill=tk.X, pady=(6, 0))
@@ -376,6 +391,52 @@ class SingleMonitor:
             share = stat.get("share", 0)
             danmaku = stat.get("danmaku", 0)
             tms = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ------- 获取 CID -------
+            cid = None
+            try:
+                pages = info.get("pages") or []
+                if pages:
+                    cid = pages[0].get("cid")
+            except:
+                cid = None
+
+            # ------- 获取在线观看人数（Total + Web） -------
+            total_online = None
+            web_online = None
+            app_online = None
+
+            if cid:
+                try:
+                    api_url = f"https://api.bilibili.com/x/player/online/total?bvid={self.bv}&cid={cid}"
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                        "Referer": "https://www.bilibili.com/",
+                    }
+                    # 禁用代理 + 捕获真实响应内容
+                    resp = requests.get(api_url,headers=headers,proxies={"http": None, "https": None})
+
+                    # 如果没拿到任何东西
+                    if not resp.text.strip():
+                        raise ValueError("API 返回空内容")
+
+                    # 尝试解析 JSON
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        # 输出返回内容方便你调试
+                        self.log(f"在线人数 API 返回非 JSON：{resp.text[:20000]}")
+                        raise
+
+                    d_online = data.get("data", {})
+                    total_online = d_online.get("total")
+                    web_online = d_online.get("count")
+
+                    if total_online is not None and web_online is not None:
+                        app_online = int(total_online) - int(web_online)
+
+                except Exception as e:
+                    self.log(f"获取在线人数失败: {e}")
 
             # sprint mode / special notify
             target_view = 10_000_000 if self.check_10m_mode else 1_000_000
@@ -424,6 +485,11 @@ class SingleMonitor:
                 "sample_count": sc,
                 "est_ransac": est_r_time,
                 "est_segment": est_s_time,
+                "est_exp": est_e_time,
+                "total_online": total_online,
+                "web_online": web_online,
+                "app_online": app_online
+
             }
 
             with self._lock:
@@ -502,6 +568,10 @@ class SingleMonitor:
                 self._est_count_var.set(str(last.get("sample_count", 0)))
                 self._est_ransac_var.set(last.get("est_ransac", "-"))
                 self._est_segment_var.set(last.get("est_segment", "-"))
+                self._est_exp_var.set(last.get("est_exp", "-"))
+                self.lbl_total_online.config(text=str(last.get("total_online", "-")))
+                self.lbl_web_online.config(text=str(last.get("web_online", "-")))
+                self.lbl_app_online.config(text=str(last.get("app_online", "-")))
 
         except Exception:
             pass
@@ -619,14 +689,14 @@ class SingleMonitor:
         # 0. 数据准备
         # ------------------------------
         if len(data) < 6:
-            return "数据不足", "数据不足", len(data), 0
+            return "数据不足", "数据不足", len(data), 0,"-","-","-"
 
         xs, ys = [], []
 
         try:
             t0 = self.parse_time(data[0]["time"])
         except:
-            return "时间格式错误", "时间格式错误", 0, 0
+            return "时间格式错误", "时间格式错误", 0, 0,"-", "-", "-"
 
         for rec in data:
             try:
@@ -642,7 +712,7 @@ class SingleMonitor:
         ys = np.array(ys, dtype=float)
 
         if len(xs) < 6:
-            return "有效数据不足", "有效数据不足", len(xs), 0
+            return "有效数据不足", "有效数据不足", len(xs), 0,"-", "-", "-"
 
         # ------------------------------
         # 1. 异常过滤（基于局部斜率 slope）
@@ -661,7 +731,7 @@ class SingleMonitor:
             ys = ys[mask]
 
             if len(xs) < 6:
-                return "有效数据不足", "有效数据不足", len(xs), med
+                return "有效数据不足", "有效数据不足", len(xs), med,"-", "-", "-"
 
         # ------------------------------
         # 2. RANSAC（主模型）
@@ -679,10 +749,10 @@ class SingleMonitor:
             a_r = ransac.estimator_.coef_[0]
             b_r = ransac.estimator_.intercept_
         except:
-            return "RANSAC失败", "RANSAC失败", len(xs), 0
+            return "RANSAC失败", "RANSAC失败", len(xs), 0,"-", "-", "-"
 
         if a_r <= 0:
-            return "增量非正", "增量非正", len(xs), 0
+            return "增量非正", "增量非正", len(xs), 0,"-", "-", "-"
 
         # ------------------------------
         # 3. 分段线性回归（自动寻找最佳分段点）
@@ -755,7 +825,7 @@ class SingleMonitor:
         # 预估达成需要的时间（指数衰减积分）
         remain = target_view - current_view
         if remain <= 0:
-            return "已达成", "已达成", len(xs), current_inc
+            return "已达成", "已达成", len(xs), current_inc,"-", "-", "-"
 
         # 指数衰减求解：sum(current_inc * decay^t) >= remain
         try:

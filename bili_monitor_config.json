@@ -1,7 +1,18 @@
 {
-    "onebot_ws_url": "ws://localhost:4120",
+    "onebot_bot_qq": 3807093079,
+    "monitored_bvs": [
+        "BV1Qc411h7Ys",
+        "BV1HWkwYWETx",
+        "BV1k3S7BkEag",
+        "BV1ZcKdzDE5Q",
+        "BV1ps411X7QG",
+        "BV1qe2tBdEHU",
+        "BV11Q2YBSEnw"
+    ],
+    "onebot_ws_url": "ws://127.0.0.1:4120",
     "onebot_enabled": true,
-    "onebot_group_id": ,
-    "onebot_user_id": ,
-    "default_interval": 15
+    "onebot_user_ids": [
+        3606346312
+    ],
+    "onebot_user_id": 3606346312
 }
